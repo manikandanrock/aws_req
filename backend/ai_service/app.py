@@ -5,6 +5,7 @@ import traceback
 from typing import Self
 from venv import logger
 import requests
+import torch
 import werkzeug
 from flask import Flask, request, jsonify, abort, session
 from pdfminer.high_level import extract_text
@@ -84,7 +85,7 @@ class Project(db.Model):
 
 # Requirement model
 class Requirement(db.Model):
-    id = db.Column(db.String(10), primary_key=True)  # Reduced size for rX format
+    id = db.Column(db.String(20), primary_key=True)  # Only one ID column
     requirement = db.Column(db.Text, nullable=False)
     categories = db.Column(db.Text, nullable=False)
     status = db.Column(db.Enum(StatusEnum), default=StatusEnum.REVIEW)
@@ -93,9 +94,7 @@ class Requirement(db.Model):
     ddate = db.Column(db.DateTime, default=datetime.now)
     complexity = db.Column(db.Enum(ComplexityEnum), default=ComplexityEnum.MODERATE)
     estimated_time = db.Column(db.Integer)
-    project_id = db.Column(db.Integer, db.ForeignKey('project.id'), nullable=True)  # Foreign key to Project
-    id = db.Column(db.String(20), primary_key=True)  
-
+    project_id = db.Column(db.Integer, db.ForeignKey('project.id'), nullable=True)
 
 
     __table_args__ = (
@@ -107,28 +106,50 @@ class Requirement(db.Model):
 
 # Example using a dedicated counter table with atomic update
 def generate_requirement_id(project_id):
-    try:
-        # Get or create counter for the project
-        counter = RequirementCounter.query.filter_by(project_id=project_id).first()
-        if not counter:
-            counter = RequirementCounter(project_id=project_id, count=0)
-            db.session.add(counter)
-        
-        # Atomically increment the counter
-        counter.count += 1
-        db.session.commit()
-        
-        return f"p{project_id}_r{counter.count}"
-        
-    except Exception as e:
-        db.session.rollback()
-        logging.error(f"ID generation failed: {str(e)}", exc_info=True)
-        raise RuntimeError("Failed to generate requirement ID")
+    for _ in range(3):  # Retry up to 3 times
+        try:
+            # Start a nested transaction
+            db.session.begin_nested()
+            
+            # Get or create counter with lock
+            counter = db.session.query(RequirementCounter).filter_by(
+                project_id=project_id
+            ).with_for_update().first()
+            
+            if not counter:
+                counter = RequirementCounter(project_id=project_id, count=0)
+                db.session.add(counter)
+                db.session.flush()  # Ensure counter exists before incrementing
+            
+            # Increment and get the new count
+            counter.count += 1
+            db.session.flush()
+            
+            # Format the ID
+            req_id = f"p{project_id}_r{counter.count}"
+            
+            # Verify the ID doesn't exist (just to be safe)
+            if not db.session.query(Requirement.id).filter_by(id=req_id).first():
+                db.session.commit()  # Commit the nested transaction
+                return req_id
+            
+            # If we get here, the ID exists (very unlikely but possible)
+            db.session.rollback()  # Rollback the nested transaction
+            continue
+            
+        except Exception as e:
+            db.session.rollback()  # Rollback the nested transaction on error
+            logging.error(f"ID generation attempt failed: {str(e)}")
+            continue
+    
+    logging.error("Failed to generate unique requirement ID after 3 attempts")
+    raise RuntimeError("Failed to generate unique requirement ID")
 
 class RequirementCounter(db.Model):
+    __tablename__ = 'requirement_counter'
     id = db.Column(db.Integer, primary_key=True)
     project_id = db.Column(db.Integer, nullable=False, unique=True)
-    count = db.Column(db.Integer, default=0)
+    count = db.Column(db.Integer, default=0, nullable=False)
 
 # Create database tables
 with app.app_context():
@@ -160,31 +181,99 @@ def generate_requirement_id(project_id):
         logging.error(f"ID generation failed: {str(e)}")
         raise RuntimeError("Failed to generate requirement ID")
 
-# Load the zero-shot classification pipeline
-zero_shot_pipeline = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
+# Configure and load the zero-shot classification pipeline with optimized settings
+zero_shot_pipeline = pipeline(
+    "zero-shot-classification",
+    model="facebook/bart-large-mnli",
+    device=0 if torch.cuda.is_available() else -1,  # Use GPU if available
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    batch_size=8  # Process multiple items at once when possible
+)
 
-def predict_estimated_time(requirement_text, complexity, priority):
+# Pre-defined time labels and templates for consistent predictions
+TIME_LABELS = ["2 hours", "4 hours", "6 hours", "8 hours", "10 hours", 
+               "12 hours", "24 hours", "48 hours", "50 hours", "72 hours"]
+TIME_HYPOTHESIS = "This requirement will take {} to implement."
+
+# Cache for frequent predictions to avoid redundant computations
+_prediction_cache = {}
+CACHE_SIZE = 1000  # Limit cache size to prevent memory issues
+
+def predict_estimated_time(requirement_text, complexity=None, priority=None):
     """
-    Predicts the estimated time for a requirement using zero-shot learning.
+    Optimized prediction of implementation time for requirements using zero-shot learning.
+    
+    Args:
+        requirement_text (str): Text of the requirement to analyze
+        complexity (str, optional): Complexity level (High/Medium/Low)
+        priority (str, optional): Priority level (High/Medium/Low)
+    
+    Returns:
+        int: Predicted hours for implementation (defaults to 4 if prediction fails)
     """
+    # Return cached result if available
+    cache_key = hash(requirement_text[:200])  # Use first 200 chars for cache key
+    if cache_key in _prediction_cache:
+        return _prediction_cache[cache_key]
+    
     try:
-        # Define candidate labels for estimated time
-        time_labels = ["2 hours", "4 hours", "6 hours", "8 hours", "10 hours", "12 hours","24 hours","48 hours","50 hours"]
-
-        # Use zero-shot learning to predict the estimated time
-        result = zero_shot_pipeline(
-            requirement_text,
-            candidate_labels=time_labels,
-            hypothesis_template="This requirement will take {} to implement."
+        # Batch processing when possible (modify if you process multiple reqs at once)
+        results = zero_shot_pipeline(
+            [requirement_text],
+            candidate_labels=TIME_LABELS,
+            hypothesis_template=TIME_HYPOTHESIS,
+            multi_label=False
         )
-
-        # Extract the predicted time (e.g., "4 hours" -> 4)
-        predicted_time = int(result['labels'][0].split()[0])  # Get the first label and extract the number
+        
+        # Handle single or batch results
+        if isinstance(results, list):
+            result = results[0]  # Get first result if batch processing
+        else:
+            result = results
+            
+        # Extract the predicted time
+        top_label = result['labels'][0]
+        predicted_time = int(top_label.split()[0])
+        
+        # Apply complexity/priority adjustments if provided
+        if complexity and priority:
+            adjustment = 1.0
+            if complexity.lower() == 'high':
+                adjustment *= 1.5
+            elif complexity.lower() == 'low':
+                adjustment *= 0.75
+                
+            if priority.lower() == 'high':
+                adjustment *= 0.8  # High priority might mean more resources allocated
+            elif priority.lower() == 'low':
+                adjustment *= 1.2
+                
+            predicted_time = max(2, round(predicted_time * adjustment))
+        
+        # Update cache and maintain size
+        if len(_prediction_cache) >= CACHE_SIZE:
+            _prediction_cache.popitem()  # Remove oldest entry
+        _prediction_cache[cache_key] = predicted_time
+        
         return predicted_time
-
+        
     except Exception as e:
-        logging.error(f"Error predicting estimated time: {str(e)}")
-        return None
+        logging.error(f"Error predicting time for '{requirement_text[:50]}...': {str(e)}")
+        
+        # Return complexity/priority based defaults if prediction fails
+        default_time = 4
+        if complexity and priority:
+            if complexity.lower() == 'high':
+                default_time = 8
+            elif complexity.lower() == 'low':
+                default_time = 2
+                
+            if priority.lower() == 'high':
+                default_time = max(2, default_time - 2)
+            elif priority.lower() == 'low':
+                default_time += 2
+                
+        return default_time
 
 # Load NLP models
 try:
@@ -523,76 +612,106 @@ def analyze_file():
         requirements = []
         sentences = text.split('.')  # Simple sentence splitting
 
+        # Get the highest existing sequence number for the project first
+        last_requirement = (
+            Requirement.query.filter_by(project_id=project_id)
+            .order_by(Requirement.id.desc())
+            .first()
+        )
+        
+        if last_requirement:
+            # Extract the sequence number from the last requirement ID
+            last_sequence = int(last_requirement.id.split('_r')[-1])
+        else:
+            last_sequence = 0
+
         for sent in sentences:
             cleaned = clean_text(sent)
             if len(cleaned.split()) < 3:
                 continue
 
-            # Generate a unique requirement ID
-            requirement_id = generate_requirement_id(project_id)
+            try:
+                # Generate sequential IDs locally
+                last_sequence += 1
+                requirement_id = f"p{project_id}_r{last_sequence}"
 
-            # Classify the requirement
-            classification = zero_shot_pipeline(cleaned, candidate_labels)
-            categories = ', '.join(classification['labels'][:3])
+                # Classify the requirement
+                classification = zero_shot_pipeline(cleaned, candidate_labels)
+                categories = ', '.join(classification['labels'][:3])
 
-            # Predict priority
-            priority_result = zero_shot_pipeline(
-                cleaned, 
-                candidate_labels=priority_labels,
-                hypothesis_template="This requirement has {} priority."
-            )
-            priority = PriorityEnum(priority_result['labels'][0].split()[0])
+                # Predict priority
+                priority_result = zero_shot_pipeline(
+                    cleaned, 
+                    candidate_labels=priority_labels,
+                    hypothesis_template="This requirement has {} priority."
+                )
+                priority = PriorityEnum(priority_result['labels'][0].split()[0])
 
-            # Predict complexity
-            complexity_result = zero_shot_pipeline(
-                cleaned,
-                candidate_labels=complexity_labels,
-                hypothesis_template="This requirement has {} complexity."
-            )
-            complexity = ComplexityEnum(complexity_result['labels'][0])
+                # Predict complexity
+                complexity_result = zero_shot_pipeline(
+                    cleaned,
+                    candidate_labels=complexity_labels,
+                    hypothesis_template="This requirement has {} complexity."
+                )
+                complexity = ComplexityEnum(complexity_result['labels'][0])
 
-            # Predict estimated time
-            estimated_time = predict_estimated_time(cleaned, complexity.value, priority.value)
-            if not estimated_time:
-                estimated_time = 4  # Default fallback value
+                # Predict estimated time
+                estimated_time = predict_estimated_time(cleaned, complexity.value, priority.value)
+                if not estimated_time:
+                    estimated_time = 4  # Default fallback value
 
-            # Create the requirement
-            requirement = Requirement(
-                id=requirement_id,
-                requirement=cleaned,
-                categories=categories,
-                status=StatusEnum.REVIEW,
-                priority=priority,
-                complexity=complexity,
-                estimated_time=estimated_time,
-                author=metadata['author'],
-                ddate=metadata['date'],
-                project_id=project_id
-            )
+                # Create the requirement
+                requirement = Requirement(
+                    id=requirement_id,
+                    requirement=cleaned,
+                    categories=categories,
+                    status=StatusEnum.REVIEW,
+                    priority=priority,
+                    complexity=complexity,
+                    estimated_time=estimated_time,
+                    author=metadata['author'],
+                    ddate=metadata['date'],
+                    project_id=project_id
+                )
 
-            db.session.add(requirement)
-            requirements.append({
-                "id": requirement.id,
-                "requirement": cleaned,
-                "categories": categories,
-                "status": requirement.status.value,
-                "priority": requirement.priority.value,
-                "complexity": requirement.complexity.value,
-                "estimated_time": estimated_time,
-                "author": requirement.author,
-                "date": requirement.ddate.isoformat()
-            })
+                db.session.add(requirement)
+                requirements.append({
+                    "id": requirement.id,
+                    "requirement": cleaned,
+                    "categories": categories,
+                    "status": requirement.status.value,
+                    "priority": requirement.priority.value,
+                    "complexity": requirement.complexity.value,
+                    "estimated_time": estimated_time,
+                    "author": requirement.author,
+                    "date": requirement.ddate.isoformat()
+                })
+
+            except Exception as e:
+                logging.error(f"Error processing requirement: {str(e)}")
+                continue  # Skip this requirement but continue with others
 
         db.session.commit()
-        return jsonify({"requirements": requirements, "total": len(requirements)})
+        
+        # Clean up the uploaded file
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
 
-    except RuntimeError as e:
-        logging.error(f"Requirement ID generation failed: {str(e)}")
-        db.session.rollback()
-        return jsonify({"error": "Failed to generate requirement ID"}), 500
+        return jsonify({
+            "requirements": requirements,
+            "total": len(requirements),
+            "project_id": project_id,
+            "project_name": project.name
+        })
+
     except Exception as e:
-        logging.error(f"Analysis error: {str(e)}", exc_info=True)
         db.session.rollback()
+        logging.error(f"Analysis error: {str(e)}", exc_info=True)
+        
+        # Clean up file if error occurred
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+            
         return jsonify({"error": "Failed to analyze file"}), 500
     
 @app.route('/api/projects/<int:project_id>/requirements', methods=['POST'])
