@@ -3,7 +3,7 @@ import axios from 'axios';
 import DOMPurify from 'dompurify';
 import './Upload.css';
 
-const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:5000';
+const API_BASE_URL = 'http://localhost:5000';
 
 function Upload() {
   const [requirements, setRequirements] = useState([]);
@@ -417,9 +417,7 @@ function Upload() {
             </div>
             <div className="hourly-rate">Hourly Rate: ${projectHourlyRate.toFixed(2)}</div>
           </div>
-          <button onClick={deleteAllRequirements} className="delete-all-btn">
-            Delete All Requirements
-          </button>
+          
           {requirements.map(req => (
             <div key={req.id} className="requirement-card">
               <div className="card-header">
